@@ -1,0 +1,58 @@
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Large AI Checkpoints & Model weights (Downloaded automatically from HuggingFace)
+checkpoints/
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+
+# User Personal Audio Files & Generated Outputs
+outputs/
+temp_uploads/
+user_audios/
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.mkv
+*.flac
+*.ogg
+*.aac
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+runs/
+flagged/
+CACHEDIR.TAG
