@@ -74,6 +74,20 @@ def extract_and_prepare_audio(file_path):
     # Create destination in temp_uploads
     out_wav = os.path.join(TEMP_UPLOADS_DIR, f"input_{int(time.time()*1000)}.wav")
 
+    # Fast-path for WAV files using soundfile directly (bypasses FFmpeg subprocess)
+    if ext == ".wav":
+        try:
+            data, in_sr = sf.read(file_path)
+            if len(data.shape) > 1:
+                data = data.mean(axis=1)
+            sf.write(out_wav, data, in_sr)
+            dur = len(data) / in_sr
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            info_text = f"✅ **Loaded Successfully:** `{base_name}` ({file_size_mb:.2f} MB | ⏱️ Duration: {dur:.1f}s | Sample Rate: {in_sr}Hz)"
+            return out_wav, info_text
+        except Exception:
+            pass
+
     # Use ffmpeg to extract or convert cleanly to 44.1kHz 16-bit mono WAV
     try:
         cmd = [
@@ -156,7 +170,8 @@ def convert_voice_fn(
             f0_condition=f0_cond,
             auto_f0_adjust=auto_f0,
             pitch_shift=int(pitch_shift),
-            stream_output=True
+            stream_output=True,
+            encode_mp3=False
         ):
             if full_audio is not None:
                 last_full_audio = full_audio
