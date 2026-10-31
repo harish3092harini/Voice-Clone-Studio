@@ -5,6 +5,7 @@ venv/
 ENV/
 
 # Python cache
+.cache/
 __pycache__/
 *.py[cod]
 *$py.class

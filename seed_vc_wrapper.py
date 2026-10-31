@@ -1,3 +1,8 @@
+import os
+_dir = os.path.dirname(os.path.abspath(__file__))
+os.environ["MPLCONFIGDIR"] = os.path.join(_dir, ".cache", "matplotlib")
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+
 import torch
 import torchaudio
 import librosa
@@ -143,9 +148,9 @@ class SeedVCWrapper:
         self.bigvgan_44k_model.remove_weight_norm()
         self.bigvgan_44k_model = self.bigvgan_44k_model.eval().to(self.device)
         
-        # Load RMVPE for F0 extraction
+        # Load RMVPE for F0 extraction on CPU to prevent CUDA OOM and cuDNN RNN crashes on long audio
         model_path = load_custom_model_from_hf("lj1995/VoiceConversionWebUI", "rmvpe.pt", None)
-        self.rmvpe = RMVPE(model_path, is_half=False, device=self.device)
+        self.rmvpe = RMVPE(model_path, is_half=False, device="cpu")
         
     @staticmethod
     def adjust_f0_semitones(f0_sequence, n_semitones):
@@ -336,6 +341,9 @@ class SeedVCWrapper:
             If stream_output is True, yields (mp3_bytes, full_audio) tuples
             If stream_output is False, returns the full audio as a numpy array
         """
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # Select appropriate models based on F0 condition
         inference_module = self.model if not f0_condition else self.model_f0
         mel_fn = self.to_mel if not f0_condition else self.to_mel_f0
@@ -458,6 +466,9 @@ class SeedVCWrapper:
                     return full_audio
                 break
         
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         if not stream_output:
             return np.concatenate(generated_wave_chunks)
         

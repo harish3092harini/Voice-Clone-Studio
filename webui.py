@@ -1,5 +1,14 @@
 import os
 import sys
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+print("[STARTUP] Starting webui.py...", flush=True)
+
+_dir = os.path.dirname(os.path.abspath(__file__))
+# Configure writable Matplotlib and cache directory inside workspace
+os.environ["MPLCONFIGDIR"] = os.path.join(_dir, ".cache", "matplotlib")
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+
 import time
 import glob
 import shutil
@@ -47,7 +56,7 @@ vc_engine = None
 def get_engine():
     global vc_engine
     if vc_engine is None:
-        print("[INFO] Initializing Seed-VC Studio Engine on CUDA GPU...")
+        print("[INFO] Initializing Seed-VC Studio Engine on CUDA GPU...", flush=True)
         vc_engine = SeedVCWrapper()
     return vc_engine
 
@@ -460,11 +469,11 @@ if __name__ == "__main__":
     ]
     allowed_dirs = [p for p in allowed_dirs if os.path.exists(p)]
 
-    print(f"[INFO] Launching Voice Clone Studio on http://{server_name}:{port} (share={args.share})")
+    print(f"[INFO] Launching Voice Clone Studio on http://{server_name}:{port} (share={args.share})", flush=True)
     demo.launch(
         server_name=server_name,
         server_port=port,
-        inbrowser=(not args.share),
+        inbrowser=False,
         share=args.share,
         allowed_paths=allowed_dirs
     )
