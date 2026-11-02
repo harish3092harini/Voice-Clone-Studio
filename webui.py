@@ -141,17 +141,20 @@ def convert_voice_fn(
     # Determine the actual source
     actual_source = source_preview_path or source_file_path
     if not actual_source or not os.path.exists(actual_source):
-        raise gr.Error("Please upload or select an audio or video file in Step 1!")
+        gr.Warning("Please upload or select an audio or video file in Step 1!")
+        return None, None, "⚠️ Please upload or select an audio or video file in Step 1!"
 
     # Ensure audio is extracted to clean WAV
     if not actual_source.lower().endswith(".wav"):
         actual_source, _ = extract_and_prepare_audio(actual_source)
         if not actual_source:
-            raise gr.Error("Could not extract audio from the provided file.")
+            gr.Warning("Could not extract audio from the provided file.")
+            return None, None, "⚠️ Could not extract audio from the provided file."
 
     actual_reference = reference_audio or SAMPLE_TARGET
     if not actual_reference or not os.path.exists(actual_reference):
-        raise gr.Error("Please provide or record a Reference Voice in Step 2!")
+        gr.Warning("Please provide or record a Reference Voice in Step 2!")
+        return None, None, "⚠️ Please provide or record a Reference Voice in Step 2!"
 
     # Ensure reference audio is extracted to clean 44.1kHz WAV (e.g. from mic webm/ogg)
     if not actual_reference.lower().endswith(".wav"):
@@ -186,7 +189,8 @@ def convert_voice_fn(
                 last_full_audio = full_audio
 
         if last_full_audio is None:
-            raise gr.Error("Voice conversion did not produce any audio. Please check your inputs.")
+            gr.Warning("Voice conversion did not produce any audio. Please check your inputs.")
+            return None, None, "⚠️ Voice conversion did not produce any audio. Please check your inputs."
 
         sr, audio_data = last_full_audio
         elapsed = time.time() - t_start
@@ -203,7 +207,8 @@ def convert_voice_fn(
         print(f"[ERROR in convert_voice_fn]: {e}")
         import traceback
         traceback.print_exc()
-        raise gr.Error(f"Error during voice conversion: {str(e)}")
+        gr.Warning(f"Error during voice conversion: {str(e)}")
+        return None, None, f"❌ Conversion Error: {str(e)}"
 
 # Gradio Interface
 theme = gr.themes.Soft(
