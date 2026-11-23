@@ -14,9 +14,12 @@ import glob
 import shutil
 import tempfile
 import subprocess
+import zipfile
 import soundfile as sf
 import numpy as np
 import torch
+
+print("[STARTUP] torch loaded (CUDA available: " + str(torch.cuda.is_available()) + ")", flush=True)
 
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -36,8 +39,10 @@ if os.path.exists(_ffmpeg_exe):
     AudioSegment.converter = _ffmpeg_exe
     AudioSegment.ffmpeg = _ffmpeg_exe
 
+print("[STARTUP] Loading Gradio and SeedVCWrapper...", flush=True)
 import gradio as gr
 from seed_vc_wrapper import SeedVCWrapper
+print("[STARTUP] Gradio and SeedVCWrapper loaded successfully", flush=True)
 
 # Directories
 OUTPUTS_DIR = os.path.join(_dir, "outputs")
@@ -210,6 +215,144 @@ def convert_voice_fn(
         gr.Warning(f"Error during voice conversion: {str(e)}")
         return None, None, f"❌ Conversion Error: {str(e)}"
 
+def batch_convert_fn(
+    uploaded_files,
+    downloads_selected,
+    target_reference,
+    mode,
+    diffusion_steps,
+    length_adjust,
+    cfg_rate,
+    pitch_shift,
+    progress=gr.Progress(track_tqdm=True)
+):
+    player_empty = [gr.update(value=None, visible=False) for _ in range(10)]
+
+    input_paths = []
+    if uploaded_files:
+        for f in (uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]):
+            p = f if isinstance(f, str) else getattr(f, "name", str(f))
+            if p and os.path.exists(p) and p not in input_paths:
+                input_paths.append(p)
+
+    if downloads_selected:
+        for fname in (downloads_selected if isinstance(downloads_selected, list) else [downloads_selected]):
+            full_p = os.path.join(DOWNLOADS_DIR, fname)
+            if os.path.exists(full_p) and full_p not in input_paths:
+                input_paths.append(full_p)
+
+    if not input_paths:
+        gr.Warning("⚠️ Please select or drop at least 1 audio or video file to clone!")
+        return (None, None, "⚠️ **No files selected.** Please upload or select up to 10 files in Step 1.", *player_empty)
+
+    actual_reference = target_reference or SAMPLE_TARGET
+    if not actual_reference or not os.path.exists(actual_reference):
+        gr.Warning("⚠️ Please provide or record a Reference Voice in Step 2!")
+        return (None, None, "⚠️ **No reference voice.** Please provide a reference voice in Step 2.", *player_empty)
+
+    # Convert reference audio to clean WAV if needed
+    if not actual_reference.lower().endswith(".wav"):
+        ref_wav, _ = extract_and_prepare_audio(actual_reference)
+        if ref_wav and os.path.exists(ref_wav):
+            actual_reference = ref_wav
+
+    progress(0.01, desc="⚡ Initializing Voice Clone Studio GPU Engine...")
+    engine = get_engine()
+
+    f0_cond = ("Pitch / F0 Conditioned" in mode)
+    auto_f0 = True
+
+    total = len(input_paths)
+    converted_files = []
+    report_lines = []
+    t_batch_start = time.time()
+
+    for idx, src_path in enumerate(input_paths):
+        file_name = os.path.basename(src_path)
+        base_progress = idx / total
+        step_progress = 1.0 / total
+
+        progress(base_progress + 0.05 * step_progress, desc=f"[{idx+1}/{total}] Preparing '{file_name}'...")
+        clean_src, prep_info = extract_and_prepare_audio(src_path)
+        if not clean_src or not os.path.exists(clean_src):
+            report_lines.append(f"❌ **[{idx+1}/{total}]** `{file_name}`: Failed to extract audio.")
+            continue
+
+        progress(base_progress + 0.25 * step_progress, desc=f"[{idx+1}/{total}] Cloning '{file_name}' on RTX 5050 GPU...")
+        t_item_start = time.time()
+
+        try:
+            last_full_audio = None
+            for mp3_chunk, full_audio in engine.convert_voice(
+                source=clean_src,
+                target=actual_reference,
+                diffusion_steps=int(diffusion_steps),
+                length_adjust=float(length_adjust),
+                inference_cfg_rate=float(cfg_rate),
+                f0_condition=f0_cond,
+                auto_f0_adjust=auto_f0,
+                pitch_shift=int(pitch_shift),
+                stream_output=True,
+                encode_mp3=False
+            ):
+                if full_audio is not None:
+                    last_full_audio = full_audio
+
+            if last_full_audio is None:
+                report_lines.append(f"❌ **[{idx+1}/{total}]** `{file_name}`: Inference did not produce audio.")
+                continue
+
+            sr, audio_data = last_full_audio
+            elapsed_item = time.time() - t_item_start
+            item_dur = len(audio_data) / sr
+
+            clean_name = os.path.splitext(file_name)[0]
+            safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in clean_name)[:40]
+            out_filename = f"batch_{idx+1:02d}_{safe_name}_{int(time.time()*1000)}.wav"
+            out_path = os.path.join(OUTPUTS_DIR, out_filename)
+            sf.write(out_path, audio_data, sr)
+
+            converted_files.append(out_path)
+            report_lines.append(
+                f"✅ **[{idx+1}/{total}]** `{file_name}` ➔ `{out_filename}` "
+                f"({item_dur:.1f}s audio | Took: {elapsed_item:.1f}s | Speed: {item_dur/max(elapsed_item, 0.01):.1f}x real-time)"
+            )
+
+        except Exception as e:
+            report_lines.append(f"❌ **[{idx+1}/{total}]** `{file_name}` Error: {str(e)}")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    total_elapsed = time.time() - t_batch_start
+
+    # Create ZIP archive of all successfully converted audios
+    zip_path = None
+    if converted_files:
+        zip_filename = f"batch_converted_voices_{int(time.time()*1000)}.zip"
+        zip_path = os.path.join(OUTPUTS_DIR, zip_filename)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in converted_files:
+                zf.write(f, arcname=os.path.basename(f))
+
+    summary = f"### 🎉 Batch Conversion Completed in {total_elapsed:.1f}s!\n"
+    summary += f"**Results:** {len(converted_files)} of {total} audio(s) cloned successfully.\n\n"
+    if zip_path:
+        summary += f"📦 **1-Click Download:** All {len(converted_files)} audios bundled into `{os.path.basename(zip_path)}` below!\n\n"
+    summary += "#### 📋 Detailed Batch Processing Log:\n" + "\n".join(report_lines)
+
+    # Generate updates for the 10 preview audio players
+    player_updates = []
+    for i in range(10):
+        if i < len(converted_files):
+            fpath = converted_files[i]
+            lbl = f"🎧 [{i+1}/{len(converted_files)}] {os.path.basename(fpath)}"
+            player_updates.append(gr.update(value=fpath, visible=True, label=lbl))
+        else:
+            player_updates.append(gr.update(value=None, visible=False))
+
+    return (zip_path, converted_files, summary, *player_updates)
+
 # Gradio Interface
 theme = gr.themes.Soft(
     primary_hue="blue",
@@ -218,7 +361,7 @@ theme = gr.themes.Soft(
 )
 
 css = """
-.gradio-container { max-width: 1150px !important; margin: auto !important; }
+.gradio-container { max-width: 1200px !important; margin: auto !important; }
 .convert-btn { font-size: 1.3rem !important; padding: 14px 28px !important; font-weight: 700 !important; }
 .info-box { padding: 8px 12px; border-radius: 6px; background-color: #f1f5f9; margin-top: 4px; }
 """
@@ -232,142 +375,273 @@ with gr.Blocks(title="Voice Clone Studio - Speech to Speech", theme=theme, css=c
         """
     )
 
-    with gr.Row():
-        # Column 1: Source Audio / Video
-        with gr.Column(scale=1):
-            gr.Markdown("### 1️⃣ Source Audio (AI Voice to Change)")
-            
-            source_file = gr.File(
-                label="📂 Upload Audio or Video File (MP4, WAV, MP3, M4A, etc.)",
-                file_types=["audio", "video", ".wav", ".mp3", ".m4a", ".mp4", ".mov", ".mkv", ".webm", ".aac", ".flac", ".ogg"],
-                type="filepath"
-            )
-            
-            source_preview = gr.Audio(
-                label="🎧 Source Audio Player (Preview what will be converted)",
-                type="filepath"
-            )
-
-            source_info = gr.Markdown("*(No file selected yet. Drag & drop any audio or video file above!)*")
-            
+    with gr.Tabs():
+        # ==================== TAB 1: SINGLE FILE CONVERSION ====================
+        with gr.TabItem("🎙️ Single Audio Clone"):
             with gr.Row():
-                load_sample_source_btn = gr.Button("⚡ Load Bhagavad Gita 30s Sample", size="sm", variant="secondary")
-                clear_source_btn = gr.Button("🗑️ Clear", size="sm", variant="stop")
+                # Column 1: Source Audio / Video
+                with gr.Column(scale=1):
+                    gr.Markdown("### 1️⃣ Source Audio (AI Voice to Change)")
+                    
+                    source_file = gr.File(
+                        label="📂 Upload Audio or Video File (MP4, WAV, MP3, M4A, etc.)",
+                        file_types=["audio", "video", ".wav", ".mp3", ".m4a", ".mp4", ".mov", ".mkv", ".webm", ".aac", ".flac", ".ogg"],
+                        type="filepath"
+                    )
+                    
+                    source_preview = gr.Audio(
+                        label="🎧 Source Audio Player (Preview what will be converted)",
+                        type="filepath"
+                    )
 
-            with gr.Accordion("📂 Quick Pick from Downloads Folder", open=True):
-                init_choices = ["-- Select from Downloads --"] + get_downloads_list()
-                source_dropdown = gr.Dropdown(
-                    label="Choose File from Downloads",
-                    choices=init_choices,
-                    value=init_choices[0],
-                    info="Selecting a file instantly extracts & loads it into the preview player above!"
+                    source_info = gr.Markdown("*(No file selected yet. Drag & drop any audio or video file above!)*")
+                    
+                    with gr.Row():
+                        load_sample_source_btn = gr.Button("⚡ Load Bhagavad Gita 30s Sample", size="sm", variant="secondary")
+                        clear_source_btn = gr.Button("🗑️ Clear", size="sm", variant="stop")
+
+                    with gr.Accordion("📂 Quick Pick from Downloads Folder", open=True):
+                        init_choices = ["-- Select from Downloads --"] + get_downloads_list()
+                        source_dropdown = gr.Dropdown(
+                            label="Choose File from Downloads",
+                            choices=init_choices,
+                            value=init_choices[0],
+                            info="Selecting a file instantly extracts & loads it into the preview player above!"
+                        )
+                        refresh_dl_btn = gr.Button("🔄 Refresh Downloads List", size="sm")
+
+                # Column 2: Target Reference Voice
+                with gr.Column(scale=1):
+                    gr.Markdown("### 2️⃣ Target Voice (Your Own Voice Profile)")
+                    
+                    target_audio = gr.Audio(
+                        value=SAMPLE_TARGET if os.path.exists(SAMPLE_TARGET) else None,
+                        label="🎙️ Reference Voice (Your Own Voice Profile)",
+                        type="filepath",
+                        sources=["microphone", "upload"]
+                    )
+                    
+                    target_info = gr.Markdown("✅ **Default Voice Profile Loaded:** User Real Voice Reference (10.8s, 44.1kHz Studio Quality)")
+
+                    with gr.Row():
+                        load_sample_target_btn = gr.Button("⚡ Reset to Default Voice Profile", size="sm", variant="secondary")
+                        clear_target_btn = gr.Button("🗑️ Clear Reference", size="sm", variant="stop")
+
+            with gr.Accordion("⚙️ Voice Tuning & Quality Settings", open=True):
+                gr.Markdown(
+                    """
+                    > 💡 **ரோபோடிக் சத்தம் வராமல் 100% நேச்சுரல் மனிதக் குரல் வர சிறந்த அமைப்புகள் (Recommended Settings):**
+                    > - **Diffusion Steps = 15:** ஆடியோவில் ஏற்படும் நொய்ஸ் மற்றும் ரோபோடிக் அதிர்வுகளை முற்றிலும் நீக்கி ஸ்மூத் ஆக்கும்.
+                    > - **CFG Rate = 0.70:** மெட்டாலிக் சவுண்டைத் தவிர்த்து, இயல்பான, ரிலாக்ஸ்டான மனித தொனியைத் தரும்.
+                    > - **Pitch Shift = -1:** கூர்மையான அல்லது செயற்கையான சவுண்ட் இல்லாமல், கம்பீரமான நேச்சுரல் மார்புக் குரல் (Chest Resonance) தரும்.
+                    """
                 )
-                refresh_dl_btn = gr.Button("🔄 Refresh Downloads List", size="sm")
+                with gr.Row():
+                    mode_select = gr.Radio(
+                        label="Conversion Mode",
+                        choices=[
+                            "Pitch / F0 Conditioned (44.1kHz Studio Quality - Best Similarity)",
+                            "Standard Timbre Transfer (22kHz Fast)"
+                        ],
+                        value="Pitch / F0 Conditioned (44.1kHz Studio Quality - Best Similarity)",
+                        info="Pitch conditioned mode preserves exact emotion, cadence, and vocal melody."
+                    )
+                with gr.Row():
+                    speed_preset = gr.Radio(
+                        label="⚡ Processing Speed Preset",
+                        choices=[
+                            "⚡ Turbo (10 Steps — Ultra Fast ~8s)",
+                            "🚀 Balanced (15 Steps — Recommended ~15s)",
+                            "💎 Studio Master (25 Steps — High Detail)"
+                        ],
+                        value="🚀 Balanced (15 Steps — Recommended ~15s)",
+                        info="Lower steps = dramatically faster processing. 15 steps provides pristine studio quality."
+                    )
+                with gr.Row():
+                    diff_steps = gr.Slider(
+                        minimum=5,
+                        maximum=50,
+                        value=15,
+                        step=1,
+                        label="Diffusion Steps",
+                        info="15 steps delivers crystal clear audio in just ~10-15 seconds on RTX 5050."
+                    )
+                    cfg_rate = gr.Slider(
+                        minimum=0.2,
+                        maximum=1.2,
+                        value=0.70,
+                        step=0.05,
+                        label="CFG Rate (Guidance Scale)",
+                        info="0.70 provides natural, warm voice without metallic artifacts."
+                    )
+                    pitch_slider = gr.Slider(
+                        minimum=-12,
+                        maximum=12,
+                        value=-1,
+                        step=1,
+                        label="Pitch Shift (Semitones)",
+                        info="-1 aligns pitch frequency perfectly with natural human chest depth."
+                    )
+                    length_slider = gr.Slider(
+                        minimum=0.8,
+                        maximum=1.3,
+                        value=1.0,
+                        step=0.05,
+                        label="Length / Speed Adjust",
+                        info="1.0 keeps original speaking pace."
+                    )
 
-        # Column 2: Target Reference Voice
-        with gr.Column(scale=1):
-            gr.Markdown("### 2️⃣ Target Voice (Your Own Voice Profile)")
-            
-            target_audio = gr.Audio(
-                value=SAMPLE_TARGET if os.path.exists(SAMPLE_TARGET) else None,
-                label="🎙️ Reference Voice (Your Own Voice Profile)",
-                type="filepath",
-                sources=["microphone", "upload"]
+            # Conversion Trigger
+            convert_btn = gr.Button("🚀 Convert Voice to My Voice (Studio Quality)", variant="primary", elem_classes=["convert-btn"])
+
+            # Output Section
+            with gr.Row():
+                with gr.Column(scale=1):
+                    output_audio = gr.Audio(
+                        label="🎧 Converted Output Audio (In Your Voice)",
+                        type="filepath"
+                    )
+                with gr.Column(scale=1):
+                    output_file = gr.File(
+                        label="⬇️ Download Converted WAV Audio (44.1kHz Master)",
+                        type="filepath"
+                    )
+
+            status_box = gr.Textbox(
+                label="Performance & Processing Status",
+                interactive=False,
+                placeholder="Ready. Click 'Convert Voice to My Voice' to start..."
             )
-            
-            target_info = gr.Markdown("✅ **Default Voice Profile Loaded:** User Real Voice Reference (10.8s, 44.1kHz Studio Quality)")
+
+        # ==================== TAB 2: BATCH CONVERSION (UP TO 10 AUDIOS) ====================
+        with gr.TabItem("⚡ Batch Clone (Up to 10 Audios at Once)"):
+            gr.Markdown(
+                """
+                ### ⚡ Batch Mode: Clone Up to 10 Audios in One Go!
+                Upload or select multiple audio/video files. Voice Clone Studio will process each file in batch using your RTX 5050 GPU, output all converted files, and generate a **1-Click ZIP bundle**.
+                """
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("### 1️⃣ Source Audio Batch (Select up to 10 Files)")
+                    batch_files = gr.File(
+                        label="📂 Drag & Drop Multiple Audio/Video Files (Up to 10 files)",
+                        file_count="multiple",
+                        file_types=["audio", "video", ".wav", ".mp3", ".m4a", ".mp4", ".mov", ".mkv", ".webm", ".aac", ".flac", ".ogg"],
+                        type="filepath"
+                    )
+                    with gr.Accordion("📂 Or Pick Multiple Files from Downloads", open=True):
+                        batch_dl_choices = get_downloads_list()
+                        batch_downloads_dropdown = gr.Dropdown(
+                            label="Select Files from Downloads",
+                            choices=batch_dl_choices,
+                            multiselect=True,
+                            info="Select multiple files to add them to your batch queue!"
+                        )
+                        refresh_batch_dl_btn = gr.Button("🔄 Refresh Downloads List", size="sm")
+
+                    batch_info = gr.Markdown("*(No files selected yet. Drag & drop up to 10 audio or video files above!)*")
+
+                    with gr.Row():
+                        load_sample_batch_btn = gr.Button("⚡ Add Sample Audio to Batch", size="sm", variant="secondary")
+                        clear_batch_btn = gr.Button("🗑️ Clear Batch Selection", size="sm", variant="stop")
+
+                with gr.Column(scale=1):
+                    gr.Markdown("### 2️⃣ Target Voice (Profile to Clone All Files Into)")
+                    batch_target_audio = gr.Audio(
+                        value=SAMPLE_TARGET if os.path.exists(SAMPLE_TARGET) else None,
+                        label="🎙️ Reference Voice (Your Real Voice Profile)",
+                        type="filepath",
+                        sources=["microphone", "upload"]
+                    )
+                    batch_target_info = gr.Markdown("✅ **Default Voice Profile Loaded:** User Real Voice Reference (10.8s, 44.1kHz Studio Quality)")
+
+                    with gr.Row():
+                        load_batch_target_btn = gr.Button("⚡ Reset to Default Voice Profile", size="sm", variant="secondary")
+                        clear_batch_target_btn = gr.Button("🗑️ Clear Reference", size="sm", variant="stop")
+
+            with gr.Accordion("⚙️ Batch Voice Tuning & Speed Settings", open=True):
+                with gr.Row():
+                    batch_mode_select = gr.Radio(
+                        label="Conversion Mode",
+                        choices=[
+                            "Pitch / F0 Conditioned (44.1kHz Studio Quality - Best Similarity)",
+                            "Standard Timbre Transfer (22kHz Fast)"
+                        ],
+                        value="Pitch / F0 Conditioned (44.1kHz Studio Quality - Best Similarity)",
+                        info="Pitch conditioned mode preserves exact emotion, cadence, and vocal melody."
+                    )
+                with gr.Row():
+                    batch_speed_preset = gr.Radio(
+                        label="⚡ Batch Processing Speed Preset",
+                        choices=[
+                            "⚡ Turbo (10 Steps — Ultra Fast ~8s per audio)",
+                            "🚀 Balanced (15 Steps — Recommended ~15s per audio)",
+                            "💎 Studio Master (25 Steps — High Detail)"
+                        ],
+                        value="🚀 Balanced (15 Steps — Recommended ~15s per audio)",
+                        info="Turbo (10 steps) allows 10 audios to finish in ~1-1.5 minutes total!"
+                    )
+                with gr.Row():
+                    batch_diff_steps = gr.Slider(
+                        minimum=5,
+                        maximum=50,
+                        value=15,
+                        step=1,
+                        label="Diffusion Steps",
+                        info="15 steps delivers crystal clear audio in ~10-15 seconds per file."
+                    )
+                    batch_cfg_rate = gr.Slider(
+                        minimum=0.2,
+                        maximum=1.2,
+                        value=0.70,
+                        step=0.05,
+                        label="CFG Rate (Guidance Scale)",
+                        info="0.70 provides natural, warm voice without metallic artifacts."
+                    )
+                    batch_pitch_slider = gr.Slider(
+                        minimum=-12,
+                        maximum=12,
+                        value=-1,
+                        step=1,
+                        label="Pitch Shift (Semitones)",
+                        info="-1 aligns pitch frequency perfectly with natural human chest depth."
+                    )
+                    batch_length_slider = gr.Slider(
+                        minimum=0.8,
+                        maximum=1.3,
+                        value=1.0,
+                        step=0.05,
+                        label="Length / Speed Adjust",
+                        info="1.0 keeps original speaking pace."
+                    )
+
+            batch_convert_btn = gr.Button("🚀 Start Batch Clone (Convert All Selected Audios)", variant="primary", elem_classes=["convert-btn"])
 
             with gr.Row():
-                load_sample_target_btn = gr.Button("⚡ Reset to Default Voice Profile", size="sm", variant="secondary")
-                clear_target_btn = gr.Button("🗑️ Clear Reference", size="sm", variant="stop")
+                with gr.Column(scale=1):
+                    batch_zip_output = gr.File(
+                        label="📦 1-Click Download All Converted Audios (ZIP Archive)",
+                        type="filepath"
+                    )
+                with gr.Column(scale=1):
+                    batch_file_list = gr.File(
+                        label="⬇️ Individual Converted Audio Files",
+                        file_count="multiple",
+                        type="filepath"
+                    )
 
-    with gr.Accordion("⚙️ Voice Tuning & Quality Settings", open=True):
-        gr.Markdown(
-            """
-            > 💡 **ரோபோடிக் சத்தம் வராமல் 100% நேச்சுரல் மனிதக் குரல் வர சிறந்த அமைப்புகள் (Recommended Settings):**
-            > - **Diffusion Steps = 35:** ஆடியோவில் ஏற்படும் நொய்ஸ் மற்றும் ரோபோடிக் அதிர்வுகளை முற்றிலும் நீக்கி ஸ்மூத் ஆக்கும்.
-            > - **CFG Rate = 0.70 (0.65 - 0.70):** மெட்டாலிக் சவுண்டைத் தவிர்த்து, இயல்பான, ரிலாக்ஸ்டான மனித தொனியைத் தரும்.
-            > - **Pitch Shift = -1:** கூர்மையான அல்லது செயற்கையான சவுண்ட் இல்லாமல், கம்பீரமான நேச்சுரல் மார்புக் குரல் (Chest Resonance) தரும்.
-            """
-        )
-        with gr.Row():
-            mode_select = gr.Radio(
-                label="Conversion Mode",
-                choices=[
-                    "Pitch / F0 Conditioned (44.1kHz Studio Quality - Best Similarity)",
-                    "Standard Timbre Transfer (22kHz Fast)"
-                ],
-                value="Pitch / F0 Conditioned (44.1kHz Studio Quality - Best Similarity)",
-                info="Pitch conditioned mode preserves exact emotion, cadence, and vocal melody."
-            )
-        with gr.Row():
-            speed_preset = gr.Radio(
-                label="⚡ Processing Speed Preset",
-                choices=[
-                    "⚡ Turbo (10 Steps — Ultra Fast ~8s)",
-                    "🚀 Balanced (15 Steps — Recommended ~15s)",
-                    "💎 Studio Master (25 Steps — High Detail)"
-                ],
-                value="🚀 Balanced (15 Steps — Recommended ~15s)",
-                info="Lower steps = dramatically faster processing. 15 steps provides pristine studio quality."
-            )
-        with gr.Row():
-            diff_steps = gr.Slider(
-                minimum=5,
-                maximum=50,
-                value=15,
-                step=1,
-                label="Diffusion Steps",
-                info="15 steps delivers crystal clear audio in just ~10-15 seconds on RTX 5050."
-            )
-            cfg_rate = gr.Slider(
-                minimum=0.2,
-                maximum=1.2,
-                value=0.70,
-                step=0.05,
-                label="CFG Rate (Guidance Scale)",
-                info="0.70 provides natural, warm voice without metallic artifacts."
-            )
-            pitch_slider = gr.Slider(
-                minimum=-12,
-                maximum=12,
-                value=-1,
-                step=1,
-                label="Pitch Shift (Semitones)",
-                info="-1 aligns pitch frequency perfectly with natural human chest depth."
-            )
-            length_slider = gr.Slider(
-                minimum=0.8,
-                maximum=1.3,
-                value=1.0,
-                step=0.05,
-                label="Length / Speed Adjust",
-                info="1.0 keeps original speaking pace."
-            )
+            batch_status_box = gr.Markdown("Ready. Upload or select files and click 'Start Batch Clone'...")
 
-    # Conversion Trigger
-    convert_btn = gr.Button("🚀 Convert Voice to My Voice (Studio Quality)", variant="primary", elem_classes=["convert-btn"])
+            batch_audio_players = []
+            with gr.Accordion("🎧 Preview Converted Audios (Up to 10 Audio Players)", open=True):
+                for row_idx in range(5):
+                    with gr.Row():
+                        p1 = gr.Audio(label=f"🎧 Audio {row_idx*2+1}", type="filepath", visible=False)
+                        p2 = gr.Audio(label=f"🎧 Audio {row_idx*2+2}", type="filepath", visible=False)
+                        batch_audio_players.extend([p1, p2])
 
-    # Output Section
-    with gr.Row():
-        with gr.Column(scale=1):
-            output_audio = gr.Audio(
-                label="🎧 Converted Output Audio (In Your Voice)",
-                type="filepath"
-            )
-        with gr.Column(scale=1):
-            output_file = gr.File(
-                label="⬇️ Download Converted WAV Audio (44.1kHz Master)",
-                type="filepath"
-            )
-
-    status_box = gr.Textbox(
-        label="Performance & Processing Status",
-        interactive=False,
-        placeholder="Ready. Click 'Convert Voice to My Voice' to start..."
-    )
-
-    # Wire event listeners
+    # ==================== EVENT LISTENERS (SINGLE FILE TAB) ====================
     def on_file_selected(fpath):
         if not fpath:
             return None, "*(No file selected)*"
@@ -400,14 +674,12 @@ with gr.Blocks(title="Voice Clone Studio - Speech to Speech", theme=theme, css=c
 
     refresh_dl_btn.click(fn=refresh_dl, outputs=source_dropdown)
 
-    # Clear buttons
     def clear_source():
         return None, None, "*(No file selected. Drop an audio or video file above!)*"
 
     clear_source_btn.click(fn=clear_source, outputs=[source_file, source_preview, source_info])
     clear_target_btn.click(lambda: (None, "⚠️ No reference voice profile loaded! Please record or upload your voice."), outputs=[target_audio, target_info])
 
-    # Preset sample buttons
     def load_preset_source():
         if os.path.exists(SAMPLE_SOURCE):
             wav_path, info = extract_and_prepare_audio(SAMPLE_SOURCE)
@@ -433,7 +705,6 @@ with gr.Blocks(title="Voice Clone Studio - Speech to Speech", theme=theme, css=c
 
     speed_preset.change(fn=update_steps_preset, inputs=[speed_preset], outputs=[diff_steps])
 
-    # Convert button handler
     convert_btn.click(
         fn=convert_voice_fn,
         inputs=[
@@ -447,6 +718,67 @@ with gr.Blocks(title="Voice Clone Studio - Speech to Speech", theme=theme, css=c
             pitch_slider
         ],
         outputs=[output_audio, output_file, status_box]
+    )
+
+    # ==================== EVENT LISTENERS (BATCH CLONE TAB) ====================
+    def on_batch_selection_change(files, dl_selected):
+        names = []
+        if files:
+            for f in files:
+                path_str = f if isinstance(f, str) else getattr(f, "name", str(f))
+                names.append(os.path.basename(path_str))
+        if dl_selected:
+            for f in dl_selected:
+                if f not in names:
+                    names.append(f)
+        if not names:
+            return "*(No files selected yet. Drag & drop up to 10 audio or video files above!)*"
+
+        badge = f"🔥 **{len(names)} File{'s' if len(names) != 1 else ''} Queued for Batch Conversion:**\n"
+        list_str = "\n".join(f"{i+1}. `{n}`" for i, n in enumerate(names[:10]))
+        if len(names) > 10:
+            list_str += f"\n*...and {len(names)-10} more files (all will be converted and included in the ZIP!)*"
+        return f"{badge}\n{list_str}"
+
+    batch_files.change(fn=on_batch_selection_change, inputs=[batch_files, batch_downloads_dropdown], outputs=batch_info)
+    batch_downloads_dropdown.change(fn=on_batch_selection_change, inputs=[batch_files, batch_downloads_dropdown], outputs=batch_info)
+
+    def refresh_batch_dl():
+        new_choices = get_downloads_list()
+        return gr.update(choices=new_choices, value=[])
+
+    refresh_batch_dl_btn.click(fn=refresh_batch_dl, outputs=batch_downloads_dropdown)
+
+    def clear_batch():
+        return None, [], "*(No files selected yet. Drag & drop up to 10 audio or video files above!)*"
+
+    clear_batch_btn.click(fn=clear_batch, outputs=[batch_files, batch_downloads_dropdown, batch_info])
+
+    def add_sample_batch():
+        if os.path.exists(SAMPLE_SOURCE):
+            return [SAMPLE_SOURCE], [], f"📁 **1 File Selected for Batch Cloning:**\n`{os.path.basename(SAMPLE_SOURCE)}`"
+        return None, [], "⚠️ Sample audio not found."
+
+    load_sample_batch_btn.click(fn=add_sample_batch, outputs=[batch_files, batch_downloads_dropdown, batch_info])
+
+    clear_batch_target_btn.click(lambda: (None, "⚠️ No reference voice profile loaded! Please record or upload your voice."), outputs=[batch_target_audio, batch_target_info])
+    load_batch_target_btn.click(fn=load_preset_target, outputs=[batch_target_audio, batch_target_info])
+
+    batch_speed_preset.change(fn=update_steps_preset, inputs=[batch_speed_preset], outputs=[batch_diff_steps])
+
+    batch_convert_btn.click(
+        fn=batch_convert_fn,
+        inputs=[
+            batch_files,
+            batch_downloads_dropdown,
+            batch_target_audio,
+            batch_mode_select,
+            batch_diff_steps,
+            batch_length_slider,
+            batch_cfg_rate,
+            batch_pitch_slider
+        ],
+        outputs=[batch_zip_output, batch_file_list, batch_status_box] + batch_audio_players
     )
 
 if __name__ == "__main__":
@@ -482,4 +814,3 @@ if __name__ == "__main__":
         share=args.share,
         allowed_paths=allowed_dirs
     )
-
