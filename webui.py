@@ -74,6 +74,21 @@ def get_downloads_list():
     items.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return [os.path.basename(p) for p in items]
 
+def get_clean_original_stem(file_path, fallback="AUDIO"):
+    """
+    Extracts the clean original file stem without path or extension.
+    Example: 'C:/Users/Downloads/HARISH.wav' -> 'HARISH'
+    """
+    if not file_path:
+        return fallback
+    base = os.path.basename(file_path)
+    stem, _ = os.path.splitext(base)
+    # If it's an internal temporary upload like 'input_176391...', return fallback
+    if stem.startswith("input_") and stem[6:].isdigit():
+        return fallback
+    clean = "".join(c for c in stem if c not in r'\/:*?"<>|').strip()
+    return clean if clean else fallback
+
 def extract_and_prepare_audio(file_path):
     """
     Extracts audio from video or converts audio to 44.1kHz mono WAV in temp_uploads.
@@ -201,12 +216,22 @@ def convert_voice_fn(
         elapsed = time.time() - t_start
         audio_dur = len(audio_data) / sr
 
-        # Save to high quality wav file with unique timestamp
-        out_filename = f"converted_voice_{int(time.time()*1000)}.wav"
+        # Determine clean original file stem: e.g. "HARISH.wav" -> "HARISH"
+        orig_stem = None
+        if source_file_path:
+            orig_stem = get_clean_original_stem(source_file_path)
+        if not orig_stem or orig_stem == "AUDIO":
+            if source_preview_path:
+                orig_stem = get_clean_original_stem(source_preview_path)
+        if not orig_stem:
+            orig_stem = "AUDIO"
+
+        # Save to high quality wav file: <ORIGINAL_NAME> CONVERTED.wav
+        out_filename = f"{orig_stem} CONVERTED.wav"
         out_path = os.path.join(OUTPUTS_DIR, out_filename)
         sf.write(out_path, audio_data, sr)
 
-        status_msg = f"🎉 Conversion Complete in {elapsed:.2f}s! (Audio Duration: {audio_dur:.2f}s | Speed: {audio_dur/elapsed:.1f}x real-time) | Saved to outputs/{out_filename}"
+        status_msg = f"🎉 Conversion Complete in {elapsed:.2f}s! (Audio Duration: {audio_dur:.2f}s | Speed: {audio_dur/elapsed:.1f}x real-time) | Saved as '{out_filename}' in outputs/"
         return out_path, out_path, status_msg
     except Exception as e:
         print(f"[ERROR in convert_voice_fn]: {e}")
@@ -265,6 +290,7 @@ def batch_convert_fn(
     total = len(input_paths)
     converted_files = []
     report_lines = []
+    used_filenames = set()
     t_batch_start = time.time()
 
     for idx, src_path in enumerate(input_paths):
@@ -306,9 +332,15 @@ def batch_convert_fn(
             elapsed_item = time.time() - t_item_start
             item_dur = len(audio_data) / sr
 
-            clean_name = os.path.splitext(file_name)[0]
-            safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in clean_name)[:40]
-            out_filename = f"batch_{idx+1:02d}_{safe_name}_{int(time.time()*1000)}.wav"
+            orig_stem = get_clean_original_stem(src_path, fallback=f"AUDIO_{idx+1}")
+            out_filename = f"{orig_stem} CONVERTED.wav"
+            # Avoid name collisions if multiple files in the batch share the exact same name
+            collision_count = 1
+            while out_filename in used_filenames:
+                collision_count += 1
+                out_filename = f"{orig_stem} CONVERTED ({collision_count}).wav"
+            used_filenames.add(out_filename)
+
             out_path = os.path.join(OUTPUTS_DIR, out_filename)
             sf.write(out_path, audio_data, sr)
 
