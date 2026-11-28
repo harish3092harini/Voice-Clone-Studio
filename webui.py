@@ -158,8 +158,14 @@ def convert_voice_fn(
     pitch_shift,
     progress=gr.Progress(track_tqdm=True)
 ):
-    # Determine the actual source
-    actual_source = source_preview_path or source_file_path
+    # Determine the actual source (handling list if multi-upload used)
+    actual_source = source_preview_path
+    if not actual_source and source_file_path:
+        if isinstance(source_file_path, list):
+            actual_source = source_file_path[0]
+        else:
+            actual_source = source_file_path
+
     if not actual_source or not os.path.exists(actual_source):
         gr.Warning("Please upload or select an audio or video file in Step 1!")
         return None, None, "⚠️ Please upload or select an audio or video file in Step 1!"
@@ -218,8 +224,9 @@ def convert_voice_fn(
 
         # Determine clean original file stem: e.g. "HARISH.wav" -> "HARISH"
         orig_stem = None
-        if source_file_path:
-            orig_stem = get_clean_original_stem(source_file_path)
+        orig_src = source_file_path[0] if isinstance(source_file_path, list) and len(source_file_path) > 0 else source_file_path
+        if orig_src:
+            orig_stem = get_clean_original_stem(orig_src)
         if not orig_stem or orig_stem == "AUDIO":
             if source_preview_path:
                 orig_stem = get_clean_original_stem(source_preview_path)
@@ -231,7 +238,14 @@ def convert_voice_fn(
         out_path = os.path.join(OUTPUTS_DIR, out_filename)
         sf.write(out_path, audio_data, sr)
 
-        status_msg = f"🎉 Conversion Complete in {elapsed:.2f}s! (Audio Duration: {audio_dur:.2f}s | Speed: {audio_dur/elapsed:.1f}x real-time) | Saved as '{out_filename}' in outputs/"
+        # Auto-copy to Downloads folder if accessible
+        if os.path.exists(DOWNLOADS_DIR):
+            try:
+                shutil.copy2(out_path, os.path.join(DOWNLOADS_DIR, out_filename))
+            except Exception:
+                pass
+
+        status_msg = f"🎉 Conversion Complete in {elapsed:.2f}s! (Audio Duration: {audio_dur:.2f}s | Speed: {audio_dur/elapsed:.1f}x real-time) | Saved as '{out_filename}' in outputs/ & Downloads!"
         return out_path, out_path, status_msg
     except Exception as e:
         print(f"[ERROR in convert_voice_fn]: {e}")
@@ -332,6 +346,7 @@ def batch_convert_fn(
             elapsed_item = time.time() - t_item_start
             item_dur = len(audio_data) / sr
 
+            # Name file: <ORIGINAL_NAME> CONVERTED.wav
             orig_stem = get_clean_original_stem(src_path, fallback=f"AUDIO_{idx+1}")
             out_filename = f"{orig_stem} CONVERTED.wav"
             # Avoid name collisions if multiple files in the batch share the exact same name
@@ -343,6 +358,13 @@ def batch_convert_fn(
 
             out_path = os.path.join(OUTPUTS_DIR, out_filename)
             sf.write(out_path, audio_data, sr)
+
+            # Auto-save copy directly to Downloads folder if accessible
+            if os.path.exists(DOWNLOADS_DIR):
+                try:
+                    shutil.copy2(out_path, os.path.join(DOWNLOADS_DIR, out_filename))
+                except Exception as ex:
+                    print(f"[WARN] Could not copy {out_filename} to Downloads: {ex}")
 
             converted_files.append(out_path)
             report_lines.append(
@@ -367,8 +389,16 @@ def batch_convert_fn(
             for f in converted_files:
                 zf.write(f, arcname=os.path.basename(f))
 
+        # Also copy zip to Downloads folder
+        if os.path.exists(DOWNLOADS_DIR):
+            try:
+                shutil.copy2(zip_path, os.path.join(DOWNLOADS_DIR, os.path.basename(zip_path)))
+            except Exception:
+                pass
+
     summary = f"### 🎉 Batch Conversion Completed in {total_elapsed:.1f}s!\n"
-    summary += f"**Results:** {len(converted_files)} of {total} audio(s) cloned successfully.\n\n"
+    summary += f"**Results:** {len(converted_files)} of {total} audio(s) cloned successfully.\n"
+    summary += f"💾 **Auto-Saved:** Files saved to `outputs/` and auto-copied directly to your `Downloads` folder!\n\n"
     if zip_path:
         summary += f"📦 **1-Click Download:** All {len(converted_files)} audios bundled into `{os.path.basename(zip_path)}` below!\n\n"
     summary += "#### 📋 Detailed Batch Processing Log:\n" + "\n".join(report_lines)
@@ -408,7 +438,138 @@ with gr.Blocks(title="Voice Clone Studio - Speech to Speech", theme=theme, css=c
     )
 
     with gr.Tabs():
-        # ==================== TAB 1: SINGLE FILE CONVERSION ====================
+        # ==================== TAB 1: BATCH CONVERSION (UP TO 10 AUDIOS) ====================
+        with gr.TabItem("⚡ Batch Voice Clone (Clone 10 Audios at Once)"):
+            gr.Markdown(
+                """
+                ### ⚡ Batch Mode: Clone Up to 10 Audios in One Go!
+                Drag & drop or select multiple files. Voice Clone Studio processes them with GPU acceleration, automatically saves each as `<ORIGINAL_NAME> CONVERTED.wav` directly to your `Downloads` and `outputs` folders, and builds a **1-Click ZIP bundle**.
+                """
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("### 1️⃣ Source Audio Batch (Select up to 10 Files)")
+                    batch_files = gr.File(
+                        label="📂 Drag & Drop Multiple Audio/Video Files (Up to 10 files)",
+                        file_count="multiple",
+                        file_types=["audio", "video", ".wav", ".mp3", ".m4a", ".mp4", ".mov", ".mkv", ".webm", ".aac", ".flac", ".ogg"],
+                        type="filepath"
+                    )
+                    with gr.Accordion("📂 Or Pick Multiple Files from Downloads Folder", open=True):
+                        batch_dl_choices = get_downloads_list()
+                        batch_downloads_dropdown = gr.Dropdown(
+                            label="Select Files from Downloads",
+                            choices=batch_dl_choices,
+                            multiselect=True,
+                            info="Select multiple files to add them to your batch queue!"
+                        )
+                        refresh_batch_dl_btn = gr.Button("🔄 Refresh Downloads List", size="sm")
+
+                    batch_info = gr.Markdown("*(No files selected yet. Drag & drop up to 10 audio or video files above!)*")
+
+                    with gr.Row():
+                        load_sample_batch_btn = gr.Button("⚡ Add Sample Audio to Batch", size="sm", variant="secondary")
+                        clear_batch_btn = gr.Button("🗑️ Clear Batch Selection", size="sm", variant="stop")
+
+                with gr.Column(scale=1):
+                    gr.Markdown("### 2️⃣ Target Voice (Profile to Clone All Files Into)")
+                    batch_target_audio = gr.Audio(
+                        value=SAMPLE_TARGET if os.path.exists(SAMPLE_TARGET) else None,
+                        label="🎙️ Reference Voice (Your Real Voice Profile)",
+                        type="filepath",
+                        sources=["microphone", "upload"]
+                    )
+                    batch_target_info = gr.Markdown("✅ **Default Voice Profile Loaded:** User Real Voice Reference (10.8s, 44.1kHz Studio Quality)")
+
+                    with gr.Row():
+                        load_batch_target_btn = gr.Button("⚡ Reset to Default Voice Profile", size="sm", variant="secondary")
+                        clear_batch_target_btn = gr.Button("🗑️ Clear Reference", size="sm", variant="stop")
+
+            with gr.Accordion("⚙️ Batch Voice Tuning & Speed Settings", open=True):
+                with gr.Row():
+                    batch_mode_select = gr.Radio(
+                        label="Conversion Mode",
+                        choices=[
+                            "Pitch / F0 Conditioned (44.1kHz Studio Quality - Best Similarity)",
+                            "Standard Timbre Transfer (22kHz Fast)"
+                        ],
+                        value="Pitch / F0 Conditioned (44.1kHz Studio Quality - Best Similarity)",
+                        info="Pitch conditioned mode preserves exact emotion, cadence, and vocal melody."
+                    )
+                with gr.Row():
+                    batch_speed_preset = gr.Radio(
+                        label="⚡ Batch Processing Speed Preset",
+                        choices=[
+                            "⚡ Turbo (10 Steps — Ultra Fast ~8s per audio)",
+                            "🚀 Balanced (15 Steps — Recommended ~15s per audio)",
+                            "💎 Studio Master (25 Steps — High Detail)"
+                        ],
+                        value="🚀 Balanced (15 Steps — Recommended ~15s per audio)",
+                        info="Turbo (10 steps) allows 10 audios to finish in ~1-1.5 minutes total!"
+                    )
+                with gr.Row():
+                    batch_diff_steps = gr.Slider(
+                        minimum=5,
+                        maximum=50,
+                        value=15,
+                        step=1,
+                        label="Diffusion Steps",
+                        info="15 steps delivers crystal clear audio in ~10-15 seconds per file."
+                    )
+                    batch_cfg_rate = gr.Slider(
+                        minimum=0.2,
+                        maximum=1.2,
+                        value=0.70,
+                        step=0.05,
+                        label="CFG Rate (Guidance Scale)",
+                        info="0.70 provides natural, warm voice without metallic artifacts."
+                    )
+                    batch_pitch_slider = gr.Slider(
+                        minimum=-12,
+                        maximum=12,
+                        value=-1,
+                        step=1,
+                        label="Pitch Shift (Semitones)",
+                        info="-1 aligns pitch frequency perfectly with natural human chest depth."
+                    )
+                    batch_length_slider = gr.Slider(
+                        minimum=0.8,
+                        maximum=1.3,
+                        value=1.0,
+                        step=0.05,
+                        label="Length / Speed Adjust",
+                        info="1.0 keeps original speaking pace."
+                    )
+
+            batch_convert_btn = gr.Button("🚀 Start Batch Clone (Convert All Selected Audios)", variant="primary", elem_classes=["convert-btn"])
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    batch_zip_output = gr.File(
+                        label="📦 1-Click Download All Converted Audios (ZIP Archive)",
+                        type="filepath"
+                    )
+                with gr.Column(scale=1):
+                    batch_file_list = gr.File(
+                        label="⬇️ Individual Converted Audio Files",
+                        file_count="multiple",
+                        type="filepath"
+                    )
+
+            with gr.Row():
+                open_outputs_btn1 = gr.Button("📂 Open Outputs Folder in Windows Explorer", size="sm")
+
+            batch_status_box = gr.Markdown("Ready. Upload or select up to 10 files and click 'Start Batch Clone'...")
+
+            batch_audio_players = []
+            with gr.Accordion("🎧 Preview Converted Audios (Up to 10 Audio Players)", open=True):
+                for row_idx in range(5):
+                    with gr.Row():
+                        p1 = gr.Audio(label=f"🎧 Audio {row_idx*2+1}", type="filepath", visible=False)
+                        p2 = gr.Audio(label=f"🎧 Audio {row_idx*2+2}", type="filepath", visible=False)
+                        batch_audio_players.extend([p1, p2])
+
+        # ==================== TAB 2: SINGLE FILE CONVERSION ====================
         with gr.TabItem("🎙️ Single Audio Clone"):
             with gr.Row():
                 # Column 1: Source Audio / Video
@@ -539,145 +700,103 @@ with gr.Blocks(title="Voice Clone Studio - Speech to Speech", theme=theme, css=c
                         type="filepath"
                     )
 
+            with gr.Row():
+                open_outputs_btn2 = gr.Button("📂 Open Outputs Folder in Windows Explorer", size="sm")
+
             status_box = gr.Textbox(
                 label="Performance & Processing Status",
                 interactive=False,
                 placeholder="Ready. Click 'Convert Voice to My Voice' to start..."
             )
 
-        # ==================== TAB 2: BATCH CONVERSION (UP TO 10 AUDIOS) ====================
-        with gr.TabItem("⚡ Batch Clone (Up to 10 Audios at Once)"):
-            gr.Markdown(
-                """
-                ### ⚡ Batch Mode: Clone Up to 10 Audios in One Go!
-                Upload or select multiple audio/video files. Voice Clone Studio will process each file in batch using your RTX 5050 GPU, output all converted files, and generate a **1-Click ZIP bundle**.
-                """
-            )
-            with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown("### 1️⃣ Source Audio Batch (Select up to 10 Files)")
-                    batch_files = gr.File(
-                        label="📂 Drag & Drop Multiple Audio/Video Files (Up to 10 files)",
-                        file_count="multiple",
-                        file_types=["audio", "video", ".wav", ".mp3", ".m4a", ".mp4", ".mov", ".mkv", ".webm", ".aac", ".flac", ".ogg"],
-                        type="filepath"
-                    )
-                    with gr.Accordion("📂 Or Pick Multiple Files from Downloads", open=True):
-                        batch_dl_choices = get_downloads_list()
-                        batch_downloads_dropdown = gr.Dropdown(
-                            label="Select Files from Downloads",
-                            choices=batch_dl_choices,
-                            multiselect=True,
-                            info="Select multiple files to add them to your batch queue!"
-                        )
-                        refresh_batch_dl_btn = gr.Button("🔄 Refresh Downloads List", size="sm")
+    # ==================== EVENT LISTENERS (BATCH CLONE TAB) ====================
+    def on_batch_selection_change(files, dl_selected):
+        names = []
+        if files:
+            for f in files:
+                path_str = f if isinstance(f, str) else getattr(f, "name", str(f))
+                names.append(os.path.basename(path_str))
+        if dl_selected:
+            for f in dl_selected:
+                if f not in names:
+                    names.append(f)
+        if not names:
+            return "*(No files selected yet. Drag & drop up to 10 audio or video files above!)*"
 
-                    batch_info = gr.Markdown("*(No files selected yet. Drag & drop up to 10 audio or video files above!)*")
+        badge = f"🔥 **{len(names)} File{'s' if len(names) != 1 else ''} Queued for Batch Conversion:**\n"
+        list_str = "\n".join(f"{i+1}. `{n}`" for i, n in enumerate(names[:10]))
+        if len(names) > 10:
+            list_str += f"\n*...and {len(names)-10} more files (all will be converted and included in the ZIP!)*"
+        return f"{badge}\n{list_str}"
 
-                    with gr.Row():
-                        load_sample_batch_btn = gr.Button("⚡ Add Sample Audio to Batch", size="sm", variant="secondary")
-                        clear_batch_btn = gr.Button("🗑️ Clear Batch Selection", size="sm", variant="stop")
+    batch_files.change(fn=on_batch_selection_change, inputs=[batch_files, batch_downloads_dropdown], outputs=batch_info)
+    batch_downloads_dropdown.change(fn=on_batch_selection_change, inputs=[batch_files, batch_downloads_dropdown], outputs=batch_info)
 
-                with gr.Column(scale=1):
-                    gr.Markdown("### 2️⃣ Target Voice (Profile to Clone All Files Into)")
-                    batch_target_audio = gr.Audio(
-                        value=SAMPLE_TARGET if os.path.exists(SAMPLE_TARGET) else None,
-                        label="🎙️ Reference Voice (Your Real Voice Profile)",
-                        type="filepath",
-                        sources=["microphone", "upload"]
-                    )
-                    batch_target_info = gr.Markdown("✅ **Default Voice Profile Loaded:** User Real Voice Reference (10.8s, 44.1kHz Studio Quality)")
+    def refresh_batch_dl():
+        new_choices = get_downloads_list()
+        return gr.update(choices=new_choices, value=[])
 
-                    with gr.Row():
-                        load_batch_target_btn = gr.Button("⚡ Reset to Default Voice Profile", size="sm", variant="secondary")
-                        clear_batch_target_btn = gr.Button("🗑️ Clear Reference", size="sm", variant="stop")
+    refresh_batch_dl_btn.click(fn=refresh_batch_dl, outputs=batch_downloads_dropdown)
 
-            with gr.Accordion("⚙️ Batch Voice Tuning & Speed Settings", open=True):
-                with gr.Row():
-                    batch_mode_select = gr.Radio(
-                        label="Conversion Mode",
-                        choices=[
-                            "Pitch / F0 Conditioned (44.1kHz Studio Quality - Best Similarity)",
-                            "Standard Timbre Transfer (22kHz Fast)"
-                        ],
-                        value="Pitch / F0 Conditioned (44.1kHz Studio Quality - Best Similarity)",
-                        info="Pitch conditioned mode preserves exact emotion, cadence, and vocal melody."
-                    )
-                with gr.Row():
-                    batch_speed_preset = gr.Radio(
-                        label="⚡ Batch Processing Speed Preset",
-                        choices=[
-                            "⚡ Turbo (10 Steps — Ultra Fast ~8s per audio)",
-                            "🚀 Balanced (15 Steps — Recommended ~15s per audio)",
-                            "💎 Studio Master (25 Steps — High Detail)"
-                        ],
-                        value="🚀 Balanced (15 Steps — Recommended ~15s per audio)",
-                        info="Turbo (10 steps) allows 10 audios to finish in ~1-1.5 minutes total!"
-                    )
-                with gr.Row():
-                    batch_diff_steps = gr.Slider(
-                        minimum=5,
-                        maximum=50,
-                        value=15,
-                        step=1,
-                        label="Diffusion Steps",
-                        info="15 steps delivers crystal clear audio in ~10-15 seconds per file."
-                    )
-                    batch_cfg_rate = gr.Slider(
-                        minimum=0.2,
-                        maximum=1.2,
-                        value=0.70,
-                        step=0.05,
-                        label="CFG Rate (Guidance Scale)",
-                        info="0.70 provides natural, warm voice without metallic artifacts."
-                    )
-                    batch_pitch_slider = gr.Slider(
-                        minimum=-12,
-                        maximum=12,
-                        value=-1,
-                        step=1,
-                        label="Pitch Shift (Semitones)",
-                        info="-1 aligns pitch frequency perfectly with natural human chest depth."
-                    )
-                    batch_length_slider = gr.Slider(
-                        minimum=0.8,
-                        maximum=1.3,
-                        value=1.0,
-                        step=0.05,
-                        label="Length / Speed Adjust",
-                        info="1.0 keeps original speaking pace."
-                    )
+    def clear_batch():
+        return None, [], "*(No files selected yet. Drag & drop up to 10 audio or video files above!)*"
 
-            batch_convert_btn = gr.Button("🚀 Start Batch Clone (Convert All Selected Audios)", variant="primary", elem_classes=["convert-btn"])
+    clear_batch_btn.click(fn=clear_batch, outputs=[batch_files, batch_downloads_dropdown, batch_info])
 
-            with gr.Row():
-                with gr.Column(scale=1):
-                    batch_zip_output = gr.File(
-                        label="📦 1-Click Download All Converted Audios (ZIP Archive)",
-                        type="filepath"
-                    )
-                with gr.Column(scale=1):
-                    batch_file_list = gr.File(
-                        label="⬇️ Individual Converted Audio Files",
-                        file_count="multiple",
-                        type="filepath"
-                    )
+    def add_sample_batch():
+        if os.path.exists(SAMPLE_SOURCE):
+            return [SAMPLE_SOURCE], [], f"📁 **1 File Selected for Batch Cloning:**\n`{os.path.basename(SAMPLE_SOURCE)}`"
+        return None, [], "⚠️ Sample audio not found."
 
-            batch_status_box = gr.Markdown("Ready. Upload or select files and click 'Start Batch Clone'...")
+    load_sample_batch_btn.click(fn=add_sample_batch, outputs=[batch_files, batch_downloads_dropdown, batch_info])
 
-            batch_audio_players = []
-            with gr.Accordion("🎧 Preview Converted Audios (Up to 10 Audio Players)", open=True):
-                for row_idx in range(5):
-                    with gr.Row():
-                        p1 = gr.Audio(label=f"🎧 Audio {row_idx*2+1}", type="filepath", visible=False)
-                        p2 = gr.Audio(label=f"🎧 Audio {row_idx*2+2}", type="filepath", visible=False)
-                        batch_audio_players.extend([p1, p2])
+    clear_batch_target_btn.click(lambda: (None, "⚠️ No reference voice profile loaded! Please record or upload your voice."), outputs=[batch_target_audio, batch_target_info])
+
+    def load_preset_target_batch():
+        if os.path.exists(SAMPLE_TARGET):
+            return SAMPLE_TARGET, "✅ **Default Voice Profile Loaded:** User Real Voice Reference (10.8s, 44.1kHz Studio Quality)"
+        return None, "⚠️ Default voice profile not found."
+
+    load_batch_target_btn.click(fn=load_preset_target_batch, outputs=[batch_target_audio, batch_target_info])
+
+    def update_steps_preset(preset):
+        if "Turbo" in preset:
+            return 10
+        elif "Balanced" in preset:
+            return 15
+        else:
+            return 25
+
+    batch_speed_preset.change(fn=update_steps_preset, inputs=[batch_speed_preset], outputs=[batch_diff_steps])
+
+    batch_convert_btn.click(
+        fn=batch_convert_fn,
+        inputs=[
+            batch_files,
+            batch_downloads_dropdown,
+            batch_target_audio,
+            batch_mode_select,
+            batch_diff_steps,
+            batch_length_slider,
+            batch_cfg_rate,
+            batch_pitch_slider
+        ],
+        outputs=[batch_zip_output, batch_file_list, batch_status_box] + batch_audio_players
+    )
+
+    def open_folder():
+        if hasattr(os, "startfile"):
+            os.startfile(OUTPUTS_DIR)
+
+    open_outputs_btn1.click(fn=open_folder)
+    open_outputs_btn2.click(fn=open_folder)
 
     # ==================== EVENT LISTENERS (SINGLE FILE TAB) ====================
     def on_file_selected(fpath):
         if not fpath:
             return None, "*(No file selected)*"
-        return extract_and_prepare_audio(fpath)
+        actual = fpath[0] if isinstance(fpath, list) and len(fpath) > 0 else fpath
+        return extract_and_prepare_audio(actual)
 
     source_file.change(
         fn=on_file_selected,
@@ -726,15 +845,6 @@ with gr.Blocks(title="Voice Clone Studio - Speech to Speech", theme=theme, css=c
         return None, "⚠️ Default voice profile not found."
 
     load_sample_target_btn.click(fn=load_preset_target, outputs=[target_audio, target_info])
-
-    def update_steps_preset(preset):
-        if "Turbo" in preset:
-            return 10
-        elif "Balanced" in preset:
-            return 15
-        else:
-            return 25
-
     speed_preset.change(fn=update_steps_preset, inputs=[speed_preset], outputs=[diff_steps])
 
     convert_btn.click(
@@ -750,67 +860,6 @@ with gr.Blocks(title="Voice Clone Studio - Speech to Speech", theme=theme, css=c
             pitch_slider
         ],
         outputs=[output_audio, output_file, status_box]
-    )
-
-    # ==================== EVENT LISTENERS (BATCH CLONE TAB) ====================
-    def on_batch_selection_change(files, dl_selected):
-        names = []
-        if files:
-            for f in files:
-                path_str = f if isinstance(f, str) else getattr(f, "name", str(f))
-                names.append(os.path.basename(path_str))
-        if dl_selected:
-            for f in dl_selected:
-                if f not in names:
-                    names.append(f)
-        if not names:
-            return "*(No files selected yet. Drag & drop up to 10 audio or video files above!)*"
-
-        badge = f"🔥 **{len(names)} File{'s' if len(names) != 1 else ''} Queued for Batch Conversion:**\n"
-        list_str = "\n".join(f"{i+1}. `{n}`" for i, n in enumerate(names[:10]))
-        if len(names) > 10:
-            list_str += f"\n*...and {len(names)-10} more files (all will be converted and included in the ZIP!)*"
-        return f"{badge}\n{list_str}"
-
-    batch_files.change(fn=on_batch_selection_change, inputs=[batch_files, batch_downloads_dropdown], outputs=batch_info)
-    batch_downloads_dropdown.change(fn=on_batch_selection_change, inputs=[batch_files, batch_downloads_dropdown], outputs=batch_info)
-
-    def refresh_batch_dl():
-        new_choices = get_downloads_list()
-        return gr.update(choices=new_choices, value=[])
-
-    refresh_batch_dl_btn.click(fn=refresh_batch_dl, outputs=batch_downloads_dropdown)
-
-    def clear_batch():
-        return None, [], "*(No files selected yet. Drag & drop up to 10 audio or video files above!)*"
-
-    clear_batch_btn.click(fn=clear_batch, outputs=[batch_files, batch_downloads_dropdown, batch_info])
-
-    def add_sample_batch():
-        if os.path.exists(SAMPLE_SOURCE):
-            return [SAMPLE_SOURCE], [], f"📁 **1 File Selected for Batch Cloning:**\n`{os.path.basename(SAMPLE_SOURCE)}`"
-        return None, [], "⚠️ Sample audio not found."
-
-    load_sample_batch_btn.click(fn=add_sample_batch, outputs=[batch_files, batch_downloads_dropdown, batch_info])
-
-    clear_batch_target_btn.click(lambda: (None, "⚠️ No reference voice profile loaded! Please record or upload your voice."), outputs=[batch_target_audio, batch_target_info])
-    load_batch_target_btn.click(fn=load_preset_target, outputs=[batch_target_audio, batch_target_info])
-
-    batch_speed_preset.change(fn=update_steps_preset, inputs=[batch_speed_preset], outputs=[batch_diff_steps])
-
-    batch_convert_btn.click(
-        fn=batch_convert_fn,
-        inputs=[
-            batch_files,
-            batch_downloads_dropdown,
-            batch_target_audio,
-            batch_mode_select,
-            batch_diff_steps,
-            batch_length_slider,
-            batch_cfg_rate,
-            batch_pitch_slider
-        ],
-        outputs=[batch_zip_output, batch_file_list, batch_status_box] + batch_audio_players
     )
 
 if __name__ == "__main__":

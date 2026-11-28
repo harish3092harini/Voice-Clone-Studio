@@ -353,80 +353,89 @@ class SeedVCWrapper:
         max_context_window = sr // hop_length * 30
         overlap_wave_len = self.overlap_frame_len * hop_length
         
-        # Load audio
+        # Process target audio (with caching for instant batch conversion of multiple audios)
+        cache_key = (str(target), bool(f0_condition), os.path.getmtime(target) if (isinstance(target, str) and os.path.exists(target)) else 0)
+        if hasattr(self, '_target_cache') and self._target_cache.get('key') == cache_key:
+            tc = self._target_cache
+            mel2 = tc['mel2']
+            style2 = tc['style2']
+            prompt_condition = tc['prompt_condition']
+            median_log_f0_ori = tc['median_log_f0_ori']
+        else:
+            ref_audio = librosa.load(target, sr=sr)[0]
+            max_ref_len = int(sr * 6.0)
+            ref_audio = torch.tensor(ref_audio[:max_ref_len]).unsqueeze(0).float().to(self.device)
+            ref_waves_16k = torchaudio.functional.resample(ref_audio, sr, 16000)
+            S_ori = self._process_whisper_features(ref_waves_16k, is_source=False)
+            mel2 = mel_fn(ref_audio.to(self.device).float())
+            target2_lengths = torch.LongTensor([mel2.size(2)]).to(mel2.device)
+            feat2 = torchaudio.compliance.kaldi.fbank(
+                ref_waves_16k,
+                num_mel_bins=80,
+                dither=0,
+                sample_frequency=16000
+            )
+            feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
+            style2 = self.campplus_model(feat2.unsqueeze(0))
+
+            if f0_condition:
+                F0_ori = self.rmvpe.infer_from_audio(ref_waves_16k[0], thred=0.03)
+                if self.device == "mps":
+                    F0_ori = torch.from_numpy(F0_ori).float().to(self.device)[None]
+                else:
+                    F0_ori = torch.from_numpy(F0_ori).to(self.device)[None]
+                voiced_F0_ori = F0_ori[F0_ori > 1]
+                voiced_log_f0_ori = torch.log(voiced_F0_ori + 1e-5)
+                median_log_f0_ori = torch.median(voiced_log_f0_ori)
+            else:
+                F0_ori = None
+                median_log_f0_ori = None
+
+            prompt_condition, _, _, _, _ = inference_module.length_regulator(
+                S_ori, ylens=target2_lengths, n_quantizers=3, f0=F0_ori
+            )
+            self._target_cache = {
+                'key': cache_key,
+                'mel2': mel2,
+                'style2': style2,
+                'prompt_condition': prompt_condition,
+                'median_log_f0_ori': median_log_f0_ori
+            }
+
+        # Load and process source audio
         source_audio = librosa.load(source, sr=sr)[0]
-        ref_audio = librosa.load(target, sr=sr)[0]
-        
-        # Process audio - Trim reference audio to optimal 6s for maximum speed and single-pass chunking
         source_audio = torch.tensor(source_audio).unsqueeze(0).float().to(self.device)
-        max_ref_len = int(sr * 6.0)
-        ref_audio = torch.tensor(ref_audio[:max_ref_len]).unsqueeze(0).float().to(self.device)
-        
-        # Resample to 16kHz for feature extraction
-        ref_waves_16k = torchaudio.functional.resample(ref_audio, sr, 16000)
         converted_waves_16k = torchaudio.functional.resample(source_audio, sr, 16000)
-        
-        # Extract Whisper features
         S_alt = self._process_whisper_features(converted_waves_16k, is_source=True)
-        S_ori = self._process_whisper_features(ref_waves_16k, is_source=False)
-        
-        # Compute mel spectrograms
         mel = mel_fn(source_audio.to(self.device).float())
-        mel2 = mel_fn(ref_audio.to(self.device).float())
-        
-        # Set target lengths
         target_lengths = torch.LongTensor([int(mel.size(2) * length_adjust)]).to(mel.device)
-        target2_lengths = torch.LongTensor([mel2.size(2)]).to(mel2.device)
-        
-        # Compute style features
-        feat2 = torchaudio.compliance.kaldi.fbank(
-            ref_waves_16k,
-            num_mel_bins=80,
-            dither=0,
-            sample_frequency=16000
-        )
-        feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
-        style2 = self.campplus_model(feat2.unsqueeze(0))
-        
-        # Process F0 if needed
+
+        # Process source F0 if needed
         if f0_condition:
-            F0_ori = self.rmvpe.infer_from_audio(ref_waves_16k[0], thred=0.03)
             F0_alt = self.rmvpe.infer_from_audio(converted_waves_16k[0], thred=0.03)
-            
             if self.device == "mps":
-                F0_ori = torch.from_numpy(F0_ori).float().to(self.device)[None]
                 F0_alt = torch.from_numpy(F0_alt).float().to(self.device)[None]
             else:
-                F0_ori = torch.from_numpy(F0_ori).to(self.device)[None]
                 F0_alt = torch.from_numpy(F0_alt).to(self.device)[None]
-            
-            voiced_F0_ori = F0_ori[F0_ori > 1]
+
             voiced_F0_alt = F0_alt[F0_alt > 1]
-            
             log_f0_alt = torch.log(F0_alt + 1e-5)
-            voiced_log_f0_ori = torch.log(voiced_F0_ori + 1e-5)
             voiced_log_f0_alt = torch.log(voiced_F0_alt + 1e-5)
-            median_log_f0_ori = torch.median(voiced_log_f0_ori)
             median_log_f0_alt = torch.median(voiced_log_f0_alt)
-            
+
             # Shift alt log f0 level to ori log f0 level
             shifted_log_f0_alt = log_f0_alt.clone()
-            if auto_f0_adjust:
+            if auto_f0_adjust and median_log_f0_ori is not None:
                 shifted_log_f0_alt[F0_alt > 1] = log_f0_alt[F0_alt > 1] - median_log_f0_alt + median_log_f0_ori
             shifted_f0_alt = torch.exp(shifted_log_f0_alt)
             if pitch_shift != 0:
                 shifted_f0_alt[F0_alt > 1] = self.adjust_f0_semitones(shifted_f0_alt[F0_alt > 1], pitch_shift)
         else:
-            F0_ori = None
-            F0_alt = None
             shifted_f0_alt = None
-        
-        # Length regulation
+
+        # Length regulation for source
         cond, _, codes, commitment_loss, codebook_loss = inference_module.length_regulator(
             S_alt, ylens=target_lengths, n_quantizers=3, f0=shifted_f0_alt
-        )
-        prompt_condition, _, codes, commitment_loss, codebook_loss = inference_module.length_regulator(
-            S_ori, ylens=target2_lengths, n_quantizers=3, f0=F0_ori
         )
         
         # Process in chunks for streaming
